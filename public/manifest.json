@@ -1,0 +1,25 @@
+{
+  "short_name": "Inimigos",
+  "name": "Inimigos - o jogo",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/enemies/192/192",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://picsum.photos/seed/enemies/512/512",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0f0f1a",
+  "display": "standalone",
+  "scope": "/",
+  "theme_color": "#000000",
+  "description": "Um jogo isométrico estilo Habbo com chat em tempo real e visual pixel art.",
+  "orientation": "portrait"
+}

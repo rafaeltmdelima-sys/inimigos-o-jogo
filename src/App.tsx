@@ -50,6 +50,8 @@ export default function App() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [showInstallBtn, setShowInstallBtn] = useState(false);
 
   const gameRef = useRef<Phaser.Game | null>(null);
   const playersSprites = useRef<Record<string, Phaser.GameObjects.Container>>({});
@@ -60,6 +62,28 @@ export default function App() {
   useEffect(() => {
     playersRef.current = players;
   }, [players]);
+
+  // PWA Install Prompt
+  useEffect(() => {
+    const handler = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      setShowInstallBtn(true);
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  const handleInstall = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      console.log('User accepted the install prompt');
+    }
+    setDeferredPrompt(null);
+    setShowInstallBtn(false);
+  };
 
   // Firebase Auth & RTDB Initialization
   useEffect(() => {
@@ -381,6 +405,21 @@ export default function App() {
             <p className="text-[10px] sm:text-xs">{isVoiceActive ? 'ON' : 'OFF'}</p>
           </div>
         </button>
+
+        {showInstallBtn && (
+          <button 
+            onClick={handleInstall}
+            className="bg-indigo-600 text-white p-3 border-2 border-white/20 flex items-center gap-3 hover:bg-indigo-500 transition-all animate-bounce"
+          >
+            <div className="w-10 h-10 bg-white/20 flex items-center justify-center">
+              <LogIn size={20} />
+            </div>
+            <div className="text-left pr-4">
+              <p className="text-[10px] font-bold uppercase">App</p>
+              <p className="text-xs font-bold">INSTALAR JOGO</p>
+            </div>
+          </button>
+        )}
       </div>
 
       <div className="absolute bottom-4 sm:bottom-8 left-1/2 -translate-x-1/2 w-full max-w-md px-4 z-10">
