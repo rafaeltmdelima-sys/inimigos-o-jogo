@@ -1,0 +1,6 @@
+{
+  "name": "Inimigos - o jogo",
+  "description": "Um jogo isométrico estilo Habbo com chat em tempo real e visual pixel art.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}

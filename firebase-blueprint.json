@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "Player": {
+      "title": "Player",
+      "description": "A player in the isometric world (Realtime Database)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "color": { "type": "number" },
+        "message": { "type": "string" },
+        "lastActive": { "type": "object" }
+      },
+      "required": ["id", "name", "x", "y", "color"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A chat message",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "object" }
+      }
+    }
+  },
+  "rtdb": {
+    "/jogadores/{playerId}": {
+      "schema": "Player",
+      "description": "Active players"
+    },
+    "/mensagens": {
+      "schema": "Message",
+      "description": "Global chat history"
+    }
+  }
+}
