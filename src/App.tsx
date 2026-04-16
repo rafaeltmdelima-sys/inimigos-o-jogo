@@ -9,7 +9,9 @@ import {
   update, 
   push, 
   onDisconnect,
-  serverTimestamp
+  serverTimestamp,
+  query,
+  limitToLast
 } from 'firebase/database';
 import { io, Socket } from 'socket.io-client';
 import { Send, User, MessageSquare, Mic, MicOff, LogIn } from 'lucide-react';
@@ -27,25 +29,29 @@ const TILE_WIDTH = 64;
 const TILE_HEIGHT = 32;
 const GRID_SIZE = 12;
 
-const cartesianToIso = (x: number, y: number) => ({
+const cartesianToIso = (x: number, y: number, z: number = 0) => ({
   x: (x - y) * (TILE_WIDTH / 2),
-  y: (x + y) * (TILE_HEIGHT / 2)
+  y: (x + y) * (TILE_HEIGHT / 2) - (z * 16) // 16 pixels height per Z level
 });
 
 interface PlayerData {
   id: string;
   x: number;
   y: number;
+  z: number;
   color: number;
   name: string;
   message: string;
+  grabbedBy?: string;
   isVoiceActive?: boolean;
 }
 
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [players, setPlayers] = useState<Record<string, PlayerData>>({});
-  const [ball, setBall] = useState<{ x: number, y: number, vx: number, vy: number }>({ x: 5, y: 5, vx: 0, vy: 0 });
+  const [ball, setBall] = useState<{ x: number, y: number, z: number, vx: number, vy: number }>({ x: 5, y: 5, z: 2, vx: 0, vy: 0 });
+  const [chatLog, setChatLog] = useState<{ id: string, name: string, text: string }[]>([]);
+  const [isChatLogVisible, setIsChatLogVisible] = useState(true);
   const [chatInput, setChatInput] = useState('');
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -58,8 +64,9 @@ export default function App() {
   const playersSprites = useRef<Record<string, Phaser.GameObjects.Container>>({});
   const peersRef = useRef<Record<string, Peer.Instance>>({});
   const playersRef = useRef<Record<string, PlayerData>>({});
-  const ballRef = useRef<{ x: number, y: number, vx: number, vy: number }>({ x: 5, y: 5, vx: 0, vy: 0 });
+  const ballRef = useRef<{ x: number, y: number, z: number, vx: number, vy: number }>({ x: 5, y: 5, z: 2, vx: 0, vy: 0 });
   const ballSprite = useRef<Phaser.GameObjects.Arc | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   // Sync players state to ref for Phaser access
   useEffect(() => {
@@ -69,6 +76,13 @@ export default function App() {
   useEffect(() => {
     ballRef.current = ball;
   }, [ball]);
+
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatLog]);
 
   // PWA Install Prompt
   useEffect(() => {
@@ -120,6 +134,7 @@ export default function App() {
             name: u.displayName || `Anon_${u.uid.substring(0, 4)}`,
             x: 5,
             y: 5,
+            z: 2, // Top floor
             color: Math.floor(Math.random() * 16777215),
             message: '',
             lastActive: serverTimestamp()
@@ -170,16 +185,29 @@ export default function App() {
     const unsubscribeBall = onValue(bolaRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
-        setBall(data);
+        setBall({ x: data.x, y: data.y, z: data.z || 0, vx: data.vx, vy: data.vy });
       } else {
         // Initialize ball if not exists
-        set(bolaRef, { x: 5, y: 5, vx: 0, vy: 0 });
+        set(bolaRef, { x: 5, y: 5, z: 2, vx: 0, vy: 0 });
       }
+    });
+
+    // Chat History Listener - Increase limit so user can scroll up a bit
+    const mensagensRef = query(ref(rtdb, 'mensagens'), limitToLast(30));
+    const unsubscribeChat = onValue(mensagensRef, (snapshot) => {
+      const data = snapshot.val() || {};
+      const messages = Object.entries(data).map(([id, msg]: [string, any]) => ({
+        id,
+        name: msg.name,
+        text: msg.text
+      }));
+      setChatLog(messages);
     });
 
     return () => {
       unsubscribe();
       unsubscribeBall();
+      unsubscribeChat();
     };
   }, [user]);
 
@@ -239,42 +267,51 @@ export default function App() {
           ground.fillRect(-2000, -2000, 4000, 4000);
           ground.setDepth(-200);
 
-          // Draw Isometric Grid
-          for (let i = 0; i < GRID_SIZE; i++) {
-            for (let j = 0; j < GRID_SIZE; j++) {
-              const { x, y } = cartesianToIso(i, j);
+          // Draw Isometric Grid (Multi-level)
+          const drawTiles = (startX: number, endX: number, startY: number, endY: number, z: number, color: number) => {
+            for (let i = startX; i < endX; i++) {
+              for (let j = startY; j < endY; j++) {
+                const { x, y } = cartesianToIso(i, j, z);
+                const points = [0, -16, 32, 0, 0, 16, -32, 0];
+                const poly = this.add.polygon(x, y, points, color);
+                poly.setStrokeStyle(1, 0x1a1a2e, 0.5);
+                poly.setInteractive(new Phaser.Geom.Polygon(points), Phaser.Geom.Polygon.Contains);
+                poly.on('pointerdown', () => enviarMovimento(i, j, z));
+                poly.on('pointerover', () => poly.setFillStyle(color + 0x111111));
+                poly.on('pointerout', () => poly.setFillStyle(color));
+                poly.setDepth(i + j + (z * 10) - 100);
+              }
+            }
+          };
+
+          // Level 1: Main Floor (Upper)
+          drawTiles(0, 12, 0, 12, 2, 0x242435);
+
+          // Level 2: Lower Floor (Platform 2)
+          drawTiles(16, 28, 0, 12, 0, 0x1a1a2e);
+
+          // Stairs (Connecting Bridge)
+          for (let i = 12; i < 16; i++) {
+            const z = 2 - (i - 12) * 0.5; // Gradual descent
+            for (let j = 4; j < 8; j++) {
+              const { x, y } = cartesianToIso(i, j, z);
               const points = [0, -16, 32, 0, 0, 16, -32, 0];
-              
-              // Draw tile background
-              const poly = this.add.polygon(x, y, points, 0x242435);
-              poly.setStrokeStyle(1, 0x1a1a2e, 0.5);
+              const poly = this.add.polygon(x, y, points, 0x3b3b4f);
+              poly.setStrokeStyle(1.5, 0x4f46e5, 0.6);
               poly.setInteractive(new Phaser.Geom.Polygon(points), Phaser.Geom.Polygon.Contains);
-              
-              poly.on('pointerdown', () => enviarMovimento(i, j));
-              poly.on('pointerover', () => poly.setFillStyle(0x32324a));
-              poly.on('pointerout', () => poly.setFillStyle(0x242435));
-              poly.setDepth(-100);
+              poly.on('pointerdown', () => enviarMovimento(i, j, z));
+              poly.setDepth(i + j + (z * 10) - 100);
             }
           }
           
-          // Draw Room Border
-          const border = this.add.graphics();
-          border.lineStyle(2, 0x4f46e5, 0.3);
-          const p1 = cartesianToIso(-0.5, -0.5);
-          const p2 = cartesianToIso(GRID_SIZE - 0.5, -0.5);
-          const p3 = cartesianToIso(GRID_SIZE - 0.5, GRID_SIZE - 0.5);
-          const p4 = cartesianToIso(-0.5, GRID_SIZE - 0.5);
-          border.strokePoints([p1, p2, p3, p4, p1], true);
-          border.setDepth(-99);
-
           // Set Camera Bounds
-          const totalWidth = GRID_SIZE * TILE_WIDTH * 2;
-          const totalHeight = GRID_SIZE * TILE_HEIGHT * 2;
-          this.cameras.main.setBounds(-totalWidth/2, -totalHeight/4, totalWidth, totalHeight);
-          this.cameras.main.centerOn(0, GRID_SIZE * TILE_HEIGHT / 2);
+          const totalWidth = 30 * TILE_WIDTH * 2;
+          const totalHeight = 15 * TILE_HEIGHT * 2;
+          this.cameras.main.setBounds(-totalWidth/2, -totalHeight/2, totalWidth, totalHeight);
+          this.cameras.main.centerOn(0, 12 * TILE_HEIGHT / 2);
           
           // Add Ball Sprite
-          const ballPos = cartesianToIso(ballRef.current.x, ballRef.current.y);
+          const ballPos = cartesianToIso(ballRef.current.x, ballRef.current.y, ballRef.current.z);
           ballSprite.current = this.add.circle(ballPos.x, ballPos.y, 12, 0xffffff).setStrokeStyle(2, 0x000000);
           ballSprite.current.setDepth(1000);
 
@@ -295,7 +332,7 @@ export default function App() {
           // Sync Sprites
           Object.keys(currentPlayers).forEach(id => {
             const p = currentPlayers[id];
-            const { x, y } = cartesianToIso(p.x, p.y);
+            const { x, y } = cartesianToIso(p.x, p.y, p.z || 0);
             
             if (!playersSprites.current[id]) {
               const container = this.add.container(x, y);
@@ -336,12 +373,33 @@ export default function App() {
               if (p.message) {
                 if (!bubble) {
                   bubble = this.add.container(0, -60).setName('bubble');
-                  const bg = this.add.rectangle(0, 0, 120, 30, 0xffffff).setOrigin(0.5).setStrokeStyle(2, 0x000000);
-                  const txt = this.add.text(0, 0, p.message, { color: '#000', fontSize: '12px', fontFamily: 'monospace' }).setOrigin(0.5);
+                  // Use a small font and word wrapping for the bubble
+                  const txt = this.add.text(0, 0, p.message, { 
+                    color: '#000', 
+                    fontSize: '11px', 
+                    fontFamily: 'monospace',
+                    align: 'center',
+                    wordWrap: { width: 100 }
+                  }).setOrigin(0.5);
+                  
+                  const bg = this.add.rectangle(0, 0, txt.width + 10, txt.height + 6, 0xffffff)
+                    .setOrigin(0.5)
+                    .setStrokeStyle(1.5, 0x000000);
+                  
                   bubble.add([bg, txt]);
+                  // Ensure text stays above background
+                  txt.setDepth(1);
                   container.add(bubble);
                 } else {
-                  (bubble.list[1] as Phaser.GameObjects.Text).setText(p.message);
+                  const txt = bubble.list[1] as Phaser.GameObjects.Text;
+                  const bg = bubble.list[0] as Phaser.GameObjects.Rectangle;
+                  if (txt.text !== p.message) {
+                    txt.setText(p.message);
+                    // Update background size dynamically
+                    bg.setSize(txt.width + 10, txt.height + 6);
+                    // Adjust container position if it grows
+                    bubble.y = -45 - (txt.height / 2);
+                  }
                 }
               } else if (bubble) {
                 bubble.destroy();
@@ -360,7 +418,7 @@ export default function App() {
           // Update Ball
           if (ballSprite.current) {
             const b = ballRef.current;
-            const targetPos = cartesianToIso(b.x, b.y);
+            const targetPos = cartesianToIso(b.x, b.y, b.z || 0);
             
             // Interpolate ball position
             ballSprite.current.x = Phaser.Math.Linear(ballSprite.current.x, targetPos.x, 0.2);
@@ -371,6 +429,18 @@ export default function App() {
             if (user) {
               const p = currentPlayers[user.uid];
               if (p) {
+                // Handle grabbing logic: if I am grabbing someone, sync their position with a small delay
+                Object.values(currentPlayers).forEach(otherP => {
+                  if (otherP.grabbedBy === user.uid) {
+                    const targetRef = ref(rtdb, `jogadores/${otherP.id}`);
+                    // Use Phaser's linear interpolation for the sync logic but locally we just push to RTDB
+                    // To get a "delay" effect, we can use a simpler lerp toward current position
+                    const lerpX = Phaser.Math.Linear(otherP.x, p.x, 0.1);
+                    const lerpY = Phaser.Math.Linear(otherP.y, p.y, 0.1);
+                    update(targetRef, { x: lerpX, y: lerpY, z: p.z });
+                  }
+                });
+
                 const dist = Phaser.Math.Distance.Between(p.x, p.y, b.x, b.y);
                 if (dist < 1.0) {
                   // Kick the ball!
@@ -394,32 +464,60 @@ export default function App() {
 
             // Ball friction and movement (simulated locally for smoothness, but synced)
             if (Math.abs(b.vx) > 0.005 || Math.abs(b.vy) > 0.005) {
-              // Heavier feel: higher friction (0.92 instead of 0.95)
               const friction = 0.92;
-              const nextX = b.x + b.vx;
-              const nextY = b.y + b.vy;
-              
-              // Boundary check with bounce
-              let finalVx = b.vx * friction;
-              let finalVy = b.vy * friction;
-              let finalX = nextX;
-              let finalY = nextY;
+              let nextX = b.x + b.vx;
+              let nextY = b.y + b.vy;
+              let nextVx = b.vx * friction;
+              let nextVy = b.vy * friction;
+              let nextZ = b.z;
 
+              // Boundary Box logic based on current section
               const margin = 0.2;
-              if (nextX < margin) { finalVx = Math.abs(finalVx) * 0.6; finalX = margin; }
-              if (nextX > GRID_SIZE - margin) { finalVx = -Math.abs(finalVx) * 0.6; finalX = GRID_SIZE - margin; }
-              if (nextY < margin) { finalVy = Math.abs(finalVy) * 0.6; finalY = margin; }
-              if (nextY > GRID_SIZE - margin) { finalVy = -Math.abs(finalVy) * 0.6; finalY = GRID_SIZE - margin; }
+              
+              const isUpper = nextX <= 12;
+              const isLower = nextX >= 16;
+              const isStairs = nextX > 12 && nextX < 16 && nextY >= 4 && nextY <= 8;
+
+              if (isUpper) {
+                // Bounds for upper floor
+                if (nextX < margin) { nextX = margin; nextVx *= -0.6; }
+                if (nextY < margin) { nextY = margin; nextVy *= -0.6; }
+                if (nextY > 12 - margin) { nextY = 12 - margin; nextVy *= -0.6; }
+                // Fall off edge if not aligned with stairs
+                if (nextX > 12 - margin && (nextY < 4 || nextY > 8)) {
+                  nextX = 12 - margin; nextVx *= -0.6;
+                }
+                nextZ = 2;
+              } else if (isLower) {
+                // Bounds for lower floor
+                if (nextX > 28 - margin) { nextX = 28 - margin; nextVx *= -0.6; }
+                if (nextY < margin) { nextY = margin; nextVy *= -0.6; }
+                if (nextY > 12 - margin) { nextY = 12 - margin; nextVy *= -0.6; }
+                // Edge check for stairs
+                if (nextX < 16 + margin && (nextY < 4 || nextY > 8)) {
+                  nextX = 16 + margin; nextVx *= -0.6;
+                }
+                nextZ = 0;
+              } else if (isStairs) {
+                // Bounds for stairs
+                if (nextY < 4 + margin) { nextY = 4 + margin; nextVy *= -0.6; }
+                if (nextY > 8 - margin) { nextY = 8 - margin; nextVy *= -0.6; }
+                nextZ = 2 - (nextX - 12) * 0.5;
+              } else {
+                // Fallback / Bounce back to upper if lost
+                nextX = 11.5; nextVx *= -1;
+              }
 
               // Only update RTDB if we are the "active" physics handler (first player in list)
               const firstPlayerId = Object.keys(currentPlayers).sort()[0];
               if (user && user.uid === firstPlayerId) {
                 const bolaRef = ref(rtdb, 'bola');
                 update(bolaRef, { 
-                  x: finalX, 
-                  y: finalY, 
-                  vx: finalVx, 
-                  vy: finalVy 
+                  x: nextX, 
+                  y: nextY, 
+                  z: nextZ,
+                  vx: nextVx, 
+                  vy: nextVy 
                 });
               }
             } else if (Math.abs(b.vx) > 0 || Math.abs(b.vy) > 0) {
@@ -442,7 +540,7 @@ export default function App() {
         gameRef.current.scale.resize(window.innerWidth, window.innerHeight);
         const scene = gameRef.current.scene.getAt(0);
         if (scene) {
-          const zoom = window.innerWidth < 640 ? 1.0 : 1.5;
+          const zoom = window.innerWidth < 640 ? 0.7 : 1.5;
           scene.cameras.main.setZoom(zoom);
         }
       }
@@ -457,10 +555,13 @@ export default function App() {
     };
   }, [user]); // Only recreate if user changes
 
-  const enviarMovimento = (x: number, y: number) => {
+  const enviarMovimento = (x: number, y: number, z: number) => {
     if (user) {
+      const currentPlayer = players[user.uid];
+      if (currentPlayer?.grabbedBy) return; // Can't move while grabbed!
+
       const playerRef = ref(rtdb, `jogadores/${user.uid}`);
-      update(playerRef, { x, y });
+      update(playerRef, { x, y, z });
     }
   };
 
@@ -469,20 +570,72 @@ export default function App() {
     if (chatInput.trim() && user) {
       const playerRef = ref(rtdb, `jogadores/${user.uid}`);
       const chatRef = ref(rtdb, 'mensagens');
+      const currentPlayer = players[user.uid];
+      const displayName = currentPlayer?.name || user.displayName || 'Anonymous';
+
+      // Check for commands
+      if (chatInput.startsWith('/name ')) {
+        const newName = chatInput.substring(6).trim();
+        if (newName) {
+          update(playerRef, { name: newName });
+          setChatInput('');
+          return;
+        }
+      }
+
+      if (chatInput.trim().toLowerCase() === '/home') {
+        update(playerRef, { x: 5, y: 5, z: 2 });
+        setChatInput('');
+        return;
+      }
+
+      if (chatInput.trim().toLowerCase() === '/grab') {
+        const me = players[user.uid];
+        if (me) {
+          // Find closest player within radius
+          let closestDist = 1.5; 
+          let targetId = null;
+
+          Object.values(players).forEach(p => {
+            if (p.id === user.uid) return;
+            const dist = Math.sqrt(Math.pow(p.x - me.x, 2) + Math.pow(p.y - me.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              targetId = p.id;
+            }
+          });
+
+          if (targetId) {
+            const targetRef = ref(rtdb, `jogadores/${targetId}`);
+            update(targetRef, { grabbedBy: user.uid });
+            
+            // Auto-release after 5 seconds
+            setTimeout(() => {
+              update(targetRef, { grabbedBy: null });
+            }, 5000);
+          }
+          
+          setChatInput('');
+          return;
+        }
+      }
       
-      // Update player message
+      // Update player message bubble
       update(playerRef, { message: chatInput });
       
       // Save to global messages
       push(chatRef, {
         uid: user.uid,
-        name: user.displayName,
+        name: displayName,
         text: chatInput,
         timestamp: serverTimestamp()
       });
 
       setChatInput('');
-      setTimeout(() => update(playerRef, { message: '' }), 5000);
+      setTimeout(() => {
+        // Check if DB exists before clearing
+        update(playerRef, { message: '' });
+      }, 5000);
     }
   };
 
@@ -495,33 +648,68 @@ export default function App() {
   }
 
   return (
-    <div className="relative w-full h-screen overflow-hidden font-mono select-none">
+    <div className="relative w-full h-screen overflow-hidden font-mono select-none bg-[#0f0f1a]">
       <div id="phaser-game" className="w-full h-full" />
       
-      <div className="absolute top-4 left-4 sm:top-6 sm:left-6 z-10 flex flex-col gap-2 sm:gap-4 max-w-[calc(100%-2rem)]">
-        <div className="bg-black/80 border-2 border-white/20 p-2 sm:p-3 flex items-center gap-3 text-white backdrop-blur-sm">
-          {user.photoURL ? (
-            <img src={user.photoURL} className="w-8 h-8 sm:w-10 sm:h-10 border-2 border-white" alt="Avatar" />
-          ) : (
-            <div className="w-8 h-8 sm:w-10 sm:h-10 border-2 border-white bg-white/10 flex items-center justify-center">
-              <User size={16} className="text-white/50" />
+      <div className="absolute top-2 left-2 sm:top-6 sm:left-6 z-10 flex flex-col gap-2 sm:gap-4 max-w-[calc(100%-1rem)]">
+        <div className="flex gap-2 items-start">
+          <div className="bg-black/80 border border-white/20 p-1.5 sm:p-3 flex items-center gap-2 sm:gap-3 text-white backdrop-blur-sm shadow-xl">
+            {user.photoURL ? (
+              <img src={user.photoURL} className="w-6 h-6 sm:w-10 sm:h-10 border border-white" alt="Avatar" />
+            ) : (
+              <div className="w-6 h-6 sm:w-10 sm:h-10 border border-white bg-white/10 flex items-center justify-center">
+                <User size={12} className="text-white/50" />
+              </div>
+            )}
+            <div className="overflow-hidden">
+              <p className="text-[7px] sm:text-[10px] text-white/50 font-bold uppercase hidden sm:block">User</p>
+              <p className="font-bold text-[10px] sm:text-sm truncate max-w-[70px] sm:max-w-none">
+                {players[user.uid]?.name || user.displayName || 'Anonymous'}
+              </p>
             </div>
-          )}
-          <div className="overflow-hidden">
-            <p className="text-[8px] sm:text-[10px] text-white/50 font-bold uppercase">User</p>
-            <p className="font-bold text-xs sm:text-sm truncate">{user.displayName || 'Anonymous'}</p>
           </div>
+
+          <button onClick={() => setIsVoiceActive(!isVoiceActive)} className={`flex items-center gap-2 p-1.5 sm:p-3 border transition-all backdrop-blur-sm shadow-xl ${isVoiceActive ? 'bg-green-500/40 border-green-500 text-green-400' : 'bg-black/80 border-white/20 text-white/60'}`}>
+            <div className={`w-6 h-6 sm:w-10 sm:h-10 flex items-center justify-center ${isVoiceActive ? 'bg-green-500 text-white' : 'bg-white/10'}`}>
+              {isVoiceActive ? <Mic size={14} /> : <MicOff size={14} />}
+            </div>
+            <div className="text-left hidden sm:block">
+              <p className="text-[8px] sm:text-[10px] font-bold uppercase">Voice</p>
+              <p className="text-[10px] sm:text-xs">{isVoiceActive ? 'ON' : 'OFF'}</p>
+            </div>
+          </button>
+          
+          <button 
+            onClick={() => setIsChatLogVisible(!isChatLogVisible)}
+            className={`sm:hidden bg-black/80 border border-white/20 p-1.5 text-white/60 flex items-center justify-center w-9 h-9 active:bg-white/10 shadow-xl`}
+          >
+            <MessageSquare size={16} className={isChatLogVisible ? 'text-indigo-400' : ''} />
+          </button>
         </div>
 
-        <button onClick={() => setIsVoiceActive(!isVoiceActive)} className={`flex items-center gap-2 sm:gap-3 p-2 sm:p-3 border-2 transition-all backdrop-blur-sm ${isVoiceActive ? 'bg-green-500/40 border-green-500 text-green-400' : 'bg-black/80 border-white/20 text-white/60'}`}>
-          <div className={`w-8 h-8 sm:w-10 sm:h-10 flex items-center justify-center ${isVoiceActive ? 'bg-green-500 text-white' : 'bg-white/10'}`}>
-            {isVoiceActive ? <Mic size={16} /> : <MicOff size={16} />}
+        <div className={`${isChatLogVisible ? 'flex' : 'hidden'} sm:flex bg-black/40 border border-white/10 p-2 sm:p-3 backdrop-blur-[2px] flex-col gap-2 max-h-[120px] sm:max-h-[160px] overflow-hidden w-full sm:w-80 hover:bg-black/60 transition-colors shadow-lg`}>
+          <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1">
+            <div className="flex items-center gap-2">
+              <MessageSquare size={12} className="text-indigo-400" />
+              <p className="text-[9px] font-bold text-white/40 uppercase tracking-widest">Chat Log</p>
+            </div>
           </div>
-          <div className="text-left">
-            <p className="text-[8px] sm:text-[10px] font-bold uppercase">Voice</p>
-            <p className="text-[10px] sm:text-xs">{isVoiceActive ? 'ON' : 'OFF'}</p>
+          <div 
+            ref={chatScrollRef}
+            className="flex flex-col gap-1 overflow-y-auto scrollbar-hide scroll-smooth"
+          >
+            {chatLog.length === 0 ? (
+              <p className="text-[9px] text-white/30 italic">No messages...</p>
+            ) : (
+              chatLog.map((msg) => (
+                <div key={msg.id} className="text-[10px] sm:text-[11px] break-words">
+                  <span className="text-indigo-400 font-bold">{msg.name}: </span>
+                  <span className="text-white/70">{msg.text}</span>
+                </div>
+              ))
+            )}
           </div>
-        </button>
+        </div>
 
         {showInstallBtn && (
           <button 
@@ -539,17 +727,18 @@ export default function App() {
         )}
       </div>
 
-      <div className="absolute bottom-4 sm:bottom-8 left-1/2 -translate-x-1/2 w-full max-w-md px-4 z-10">
+      <div className="absolute bottom-4 sm:bottom-8 left-1/2 -translate-x-1/2 w-full max-w-[95vw] sm:max-w-md px-2 sm:px-4 z-10">
         <form onSubmit={handleSendChat} className="flex gap-1 sm:gap-2">
           <input
             type="text"
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
-            placeholder="DIGITE ALGO..."
-            className="flex-1 bg-black/90 border-2 border-white/20 px-4 sm:px-6 py-3 sm:py-4 text-white text-sm sm:text-base focus:outline-none focus:border-indigo-500 font-mono backdrop-blur-md"
+            maxLength={60}
+            placeholder="DIGITE..."
+            className="flex-1 bg-black/95 border border-white/20 px-3 sm:px-6 py-2.5 sm:py-4 text-white text-[13px] sm:text-base focus:outline-none focus:border-indigo-500 font-mono backdrop-blur-md shadow-2xl rounded-none appearance-none"
           />
-          <button type="submit" className="bg-indigo-600 text-white p-3 sm:p-4 border-b-4 border-indigo-900 hover:bg-indigo-500 active:translate-y-1 active:border-b-0">
-            <Send size={20} />
+          <button type="submit" className="bg-indigo-600 text-white px-4 sm:px-6 py-2.5 sm:py-4 border-b-4 border-indigo-900 hover:bg-indigo-500 active:translate-y-1 active:border-b-0 transition-all">
+            <Send size={18} />
           </button>
         </form>
       </div>
