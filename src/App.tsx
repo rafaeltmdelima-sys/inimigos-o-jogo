@@ -45,6 +45,7 @@ interface PlayerData {
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [players, setPlayers] = useState<Record<string, PlayerData>>({});
+  const [ball, setBall] = useState<{ x: number, y: number, vx: number, vy: number }>({ x: 5, y: 5, vx: 0, vy: 0 });
   const [chatInput, setChatInput] = useState('');
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -57,11 +58,17 @@ export default function App() {
   const playersSprites = useRef<Record<string, Phaser.GameObjects.Container>>({});
   const peersRef = useRef<Record<string, Peer.Instance>>({});
   const playersRef = useRef<Record<string, PlayerData>>({});
+  const ballRef = useRef<{ x: number, y: number, vx: number, vy: number }>({ x: 5, y: 5, vx: 0, vy: 0 });
+  const ballSprite = useRef<Phaser.GameObjects.Arc | null>(null);
 
   // Sync players state to ref for Phaser access
   useEffect(() => {
     playersRef.current = players;
   }, [players]);
+
+  useEffect(() => {
+    ballRef.current = ball;
+  }, [ball]);
 
   // PWA Install Prompt
   useEffect(() => {
@@ -157,7 +164,23 @@ export default function App() {
     }, (error) => {
       console.error("RTDB onValue Error:", error);
     });
-    return () => unsubscribe();
+
+    // Ball Listener
+    const bolaRef = ref(rtdb, 'bola');
+    const unsubscribeBall = onValue(bolaRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        setBall(data);
+      } else {
+        // Initialize ball if not exists
+        set(bolaRef, { x: 5, y: 5, vx: 0, vy: 0 });
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      unsubscribeBall();
+    };
   }, [user]);
 
   // WebRTC Signaling (Signaling only)
@@ -250,6 +273,11 @@ export default function App() {
           this.cameras.main.setBounds(-totalWidth/2, -totalHeight/4, totalWidth, totalHeight);
           this.cameras.main.centerOn(0, GRID_SIZE * TILE_HEIGHT / 2);
           
+          // Add Ball Sprite
+          const ballPos = cartesianToIso(ballRef.current.x, ballRef.current.y);
+          ballSprite.current = this.add.circle(ballPos.x, ballPos.y, 12, 0xffffff).setStrokeStyle(2, 0x000000);
+          ballSprite.current.setDepth(1000);
+
           // Responsive zoom
           const zoom = window.innerWidth < 640 ? 1.0 : 1.5;
           this.cameras.main.setZoom(zoom);
@@ -271,33 +299,47 @@ export default function App() {
             
             if (!playersSprites.current[id]) {
               const container = this.add.container(x, y);
+              
+              // Generic Avatar
               const body = this.add.rectangle(0, -10, 20, 40, p.color).setStrokeStyle(2, 0xffffff);
               const head = this.add.rectangle(0, -30, 16, 16, 0xffe0bd);
               const name = this.add.text(0, 20, p.name, { fontSize: '12px', fontStyle: 'bold', fontFamily: 'monospace' }).setOrigin(0.5);
+              
               container.add([body, head, name]);
               container.setDepth(p.x + p.y);
               playersSprites.current[id] = container;
             } else {
-              const sprite = playersSprites.current[id];
-              sprite.x = Phaser.Math.Linear(sprite.x, x, 0.1);
-              sprite.y = Phaser.Math.Linear(sprite.y, y, 0.1);
-              sprite.setDepth(p.x + p.y);
+              const container = playersSprites.current[id];
+              
+              const oldX = container.x;
+              const oldY = container.y;
+              
+              // Smoother and slower movement
+              container.x = Phaser.Math.Linear(container.x, x, 0.04);
+              container.y = Phaser.Math.Linear(container.y, y, 0.04);
+              container.setDepth(p.x + p.y);
+
+              // Subtle bobbing animation when moving
+              const isMoving = Math.abs(container.x - oldX) > 0.1 || Math.abs(container.y - oldY) > 0.1;
+              if (isMoving) {
+                container.y += Math.sin(this.time.now / 100) * 0.5;
+              }
 
               // Camera follow local player
               if (user && id === user.uid) {
-                this.cameras.main.scrollX = Phaser.Math.Linear(this.cameras.main.scrollX, sprite.x - window.innerWidth / (2 * this.cameras.main.zoom), 0.05);
-                this.cameras.main.scrollY = Phaser.Math.Linear(this.cameras.main.scrollY, sprite.y - window.innerHeight / (2 * this.cameras.main.zoom), 0.05);
+                this.cameras.main.scrollX = Phaser.Math.Linear(this.cameras.main.scrollX, container.x - window.innerWidth / (2 * this.cameras.main.zoom), 0.03);
+                this.cameras.main.scrollY = Phaser.Math.Linear(this.cameras.main.scrollY, container.y - window.innerHeight / (2 * this.cameras.main.zoom), 0.03);
               }
               
               // Chat Bubble
-              let bubble = sprite.getByName('bubble') as Phaser.GameObjects.Container;
+              let bubble = container.getByName('bubble') as Phaser.GameObjects.Container;
               if (p.message) {
                 if (!bubble) {
                   bubble = this.add.container(0, -60).setName('bubble');
                   const bg = this.add.rectangle(0, 0, 120, 30, 0xffffff).setOrigin(0.5).setStrokeStyle(2, 0x000000);
                   const txt = this.add.text(0, 0, p.message, { color: '#000', fontSize: '12px', fontFamily: 'monospace' }).setOrigin(0.5);
                   bubble.add([bg, txt]);
-                  sprite.add(bubble);
+                  container.add(bubble);
                 } else {
                   (bubble.list[1] as Phaser.GameObjects.Text).setText(p.message);
                 }
@@ -314,6 +356,81 @@ export default function App() {
               delete playersSprites.current[id];
             }
           });
+
+          // Update Ball
+          if (ballSprite.current) {
+            const b = ballRef.current;
+            const targetPos = cartesianToIso(b.x, b.y);
+            
+            // Interpolate ball position
+            ballSprite.current.x = Phaser.Math.Linear(ballSprite.current.x, targetPos.x, 0.2);
+            ballSprite.current.y = Phaser.Math.Linear(ballSprite.current.y, targetPos.y, 0.2);
+            ballSprite.current.setDepth(b.x + b.y + 1);
+
+            // Local Physics (only for the local player to avoid conflicts)
+            if (user) {
+              const p = currentPlayers[user.uid];
+              if (p) {
+                const dist = Phaser.Math.Distance.Between(p.x, p.y, b.x, b.y);
+                if (dist < 1.0) {
+                  // Kick the ball!
+                  const angle = Phaser.Math.Angle.Between(p.x, p.y, b.x, b.y);
+                  // Heavier feel: lower force (0.3 instead of 0.5)
+                  const force = 0.3;
+                  const newVx = Math.cos(angle) * force;
+                  const newVy = Math.sin(angle) * force;
+                  
+                  // Update ball in RTDB
+                  const bolaRef = ref(rtdb, 'bola');
+                  update(bolaRef, { 
+                    vx: newVx, 
+                    vy: newVy,
+                    x: b.x + newVx * 0.5, // Small nudge to prevent getting stuck
+                    y: b.y + newVy * 0.5
+                  });
+                }
+              }
+            }
+
+            // Ball friction and movement (simulated locally for smoothness, but synced)
+            if (Math.abs(b.vx) > 0.005 || Math.abs(b.vy) > 0.005) {
+              // Heavier feel: higher friction (0.92 instead of 0.95)
+              const friction = 0.92;
+              const nextX = b.x + b.vx;
+              const nextY = b.y + b.vy;
+              
+              // Boundary check with bounce
+              let finalVx = b.vx * friction;
+              let finalVy = b.vy * friction;
+              let finalX = nextX;
+              let finalY = nextY;
+
+              const margin = 0.2;
+              if (nextX < margin) { finalVx = Math.abs(finalVx) * 0.6; finalX = margin; }
+              if (nextX > GRID_SIZE - margin) { finalVx = -Math.abs(finalVx) * 0.6; finalX = GRID_SIZE - margin; }
+              if (nextY < margin) { finalVy = Math.abs(finalVy) * 0.6; finalY = margin; }
+              if (nextY > GRID_SIZE - margin) { finalVy = -Math.abs(finalVy) * 0.6; finalY = GRID_SIZE - margin; }
+
+              // Only update RTDB if we are the "active" physics handler (first player in list)
+              const firstPlayerId = Object.keys(currentPlayers).sort()[0];
+              if (user && user.uid === firstPlayerId) {
+                const bolaRef = ref(rtdb, 'bola');
+                update(bolaRef, { 
+                  x: finalX, 
+                  y: finalY, 
+                  vx: finalVx, 
+                  vy: finalVy 
+                });
+              }
+            } else if (Math.abs(b.vx) > 0 || Math.abs(b.vy) > 0) {
+              // Stop completely if very slow
+              const firstPlayerId = Object.keys(currentPlayers).sort()[0];
+              if (user && user.uid === firstPlayerId) {
+                const bolaRef = ref(rtdb, 'bola');
+                update(bolaRef, { vx: 0, vy: 0 });
+              }
+            }
+          }
         }
       }
     };
