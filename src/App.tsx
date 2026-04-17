@@ -57,6 +57,8 @@ export default function App() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isCustomizing, setIsCustomizing] = useState(false);
+  const movementInterval = useRef<NodeJS.Timeout | null>(null);
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [showInstallBtn, setShowInstallBtn] = useState(false);
 
@@ -104,6 +106,81 @@ export default function App() {
     }
     setDeferredPrompt(null);
     setShowInstallBtn(false);
+  };
+
+  const COLORS = [
+    0x4f46e5, // indigo
+    0xef4444, // red
+    0x10b981, // emerald
+    0xf59e0b, // amber
+    0x3b82f6, // blue
+    0x8b5cf6, // violet
+    0xec4899, // pink
+    0x6366f1, // indigo-light
+  ];
+
+  const handleUpdateCustomization = (updates: Partial<PlayerData>) => {
+    if (user) {
+      const playerRef = ref(rtdb, `jogadores/${user.uid}`);
+      update(playerRef, updates);
+    }
+  };
+
+  const isWalkable = (x: number, y: number, z: number) => {
+    // Round for safer checking
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    
+    // Level 1
+    if (rx >= 0 && rx < 12 && ry >= 0 && ry < 12) return Math.abs(z - 2) < 0.1;
+    // Level 2
+    if (rx >= 16 && rx <= 28 && ry >= 0 && ry < 12) return Math.abs(z - 0) < 0.1;
+    // Stairs
+    if (rx >= 12 && rx < 16 && ry >= 4 && ry < 8) {
+      const expectedZ = 2 - (rx - 12) * 0.5;
+      return Math.abs(z - expectedZ) < 0.1;
+    }
+    return false;
+  };
+
+  const getStairZ = (x: number) => 2 - (Math.round(x) - 12) * 0.5;
+
+  const findPath = (start: {x: number, y: number, z: number}, end: {x: number, y: number, z: number}) => {
+    const queue: {x: number, y: number, z: number, path: {x: number, y: number, z: number}[]}[] = [
+      { ...start, path: [] }
+    ];
+    const visited = new Set<string>();
+    visited.add(`${Math.round(start.x)},${Math.round(start.y)},${start.z}`);
+
+    const directions = [
+      {x: 1, y: 0}, {x: -1, y: 0}, {x: 0, y: 1}, {x: 0, y: -1}
+    ];
+
+    while (queue.length > 0) {
+      const {x, y, z, path} = queue.shift()!;
+      
+      if (Math.round(x) === Math.round(end.x) && Math.round(y) === Math.round(end.y)) {
+        return [...path, {x: end.x, y: end.y, z: end.z}];
+      }
+
+      for (const dir of directions) {
+        let nx = Math.round(x + dir.x);
+        let ny = Math.round(y + dir.y);
+        let nz = z;
+
+        // Auto-adjust Z for level boundaries
+        if (nx < 12) nz = 2;
+        else if (nx > 15) nz = 0;
+        else if (nx >= 12 && nx <= 15) nz = getStairZ(nx);
+
+        const key = `${nx},${ny},${nz}`;
+        if (!visited.has(key) && isWalkable(nx, ny, nz)) {
+          visited.add(key);
+          queue.push({x: nx, y: ny, z: nz, path: [...path, {x: nx, y: ny, z: nz}]});
+        }
+      }
+    }
+    return null;
   };
 
   // Firebase Auth & RTDB Initialization
@@ -355,9 +432,9 @@ export default function App() {
               const oldY = container.y;
               const { x: isoX, y: isoY } = cartesianToIso(p.x, p.y, p.z || 0);
               
-              // Smoother and slower movement
-              container.x = Phaser.Math.Linear(container.x, isoX, 0.04);
-              container.y = Phaser.Math.Linear(container.y, isoY, 0.04);
+              // Smoother and faster movement
+              container.x = Phaser.Math.Linear(container.x, isoX, 0.1);
+              container.y = Phaser.Math.Linear(container.y, isoY, 0.1);
               container.setDepth(p.x + p.y + (p.z || 0) * 100);
 
               // Update name if changed
@@ -374,8 +451,8 @@ export default function App() {
 
               // Camera follow local player
               if (user && id === user.uid) {
-                this.cameras.main.scrollX = Phaser.Math.Linear(this.cameras.main.scrollX, container.x - window.innerWidth / (2 * this.cameras.main.zoom), 0.03);
-                this.cameras.main.scrollY = Phaser.Math.Linear(this.cameras.main.scrollY, container.y - window.innerHeight / (2 * this.cameras.main.zoom), 0.03);
+                this.cameras.main.scrollX = Phaser.Math.Linear(this.cameras.main.scrollX, container.x - window.innerWidth / (2 * this.cameras.main.zoom), 0.08);
+                this.cameras.main.scrollY = Phaser.Math.Linear(this.cameras.main.scrollY, container.y - window.innerHeight / (2 * this.cameras.main.zoom), 0.08);
               }
               
               // Chat Bubble
@@ -568,26 +645,30 @@ export default function App() {
     };
   }, [user]); // Only recreate if user changes
 
-  const enviarMovimento = (x: number, y: number, z: number) => {
+  const enviarMovimento = (tx: number, ty: number, tz: number) => {
     if (user) {
-      // USE REF to avoid closure staleness
       const currentPlayers = playersRef.current;
-      const currentPlayer = currentPlayers[user.uid];
-      if (!currentPlayer) return;
-      if (currentPlayer.grabbedBy) return; // Can't move while grabbed!
+      const me = currentPlayers[user.uid];
+      if (!me || me.grabbedBy) return;
 
-      // Teleport Constraint: Must use stairs to switch floors
-      const isTargetStairs = x >= 12 && x <= 16;
-      const isCurrentStairs = currentPlayer.x >= 12 && currentPlayer.x <= 16;
-      
-      if (Math.abs(currentPlayer.z - z) > 0.1) {
-        if (!isTargetStairs && !isCurrentStairs) {
+      // Clear existing movement
+      if (movementInterval.current) clearInterval(movementInterval.current);
+
+      const path = findPath({x: me.x, y: me.y, z: me.z}, {x: tx, y: ty, z: tz});
+      if (!path || path.length === 0) return;
+
+      let step = 0;
+      movementInterval.current = setInterval(() => {
+        if (step >= path.length) {
+          if (movementInterval.current) clearInterval(movementInterval.current);
           return;
         }
-      }
-
-      const playerRef = ref(rtdb, `jogadores/${user.uid}`);
-      update(playerRef, { x, y, z });
+        
+        const next = path[step];
+        const playerRef = ref(rtdb, `jogadores/${user.uid}`);
+        update(playerRef, { x: next.x, y: next.y, z: next.z });
+        step++;
+      }, 70); // Improved responsiveness: faster grid steps
     }
   };
 
@@ -683,16 +764,19 @@ export default function App() {
       
       <div className="absolute top-2 left-2 sm:top-6 sm:left-6 z-10 flex flex-col gap-2 sm:gap-4 max-w-[calc(100%-1rem)]">
         <div className="flex gap-2 items-start">
-          <div className="bg-black/80 border sm:border-2 border-white/20 p-1.5 sm:p-3 flex items-center gap-2 sm:gap-4 text-white backdrop-blur-sm shadow-2xl">
+          <div 
+            onClick={() => setIsCustomizing(true)}
+            className="bg-black/80 border sm:border-2 border-white/20 p-1.5 sm:p-3 flex items-center gap-2 sm:gap-4 text-white backdrop-blur-sm shadow-2xl cursor-pointer hover:border-indigo-500 transition-all group"
+          >
             {user.photoURL ? (
-              <img src={user.photoURL} className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white" alt="Avatar" referrerPolicy="no-referrer" />
+              <img src={user.photoURL} className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white group-hover:scale-110 transition-transform" alt="Avatar" referrerPolicy="no-referrer" />
             ) : (
-              <div className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white bg-white/10 flex items-center justify-center">
+              <div className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
                 <User size={12} className="text-white/50 sm:size-6" />
               </div>
             )}
             <div className="overflow-hidden">
-              <p className="text-[7px] sm:text-[11px] text-white/50 font-bold uppercase hidden sm:block">User</p>
+              <p className="text-[7px] sm:text-[11px] text-white/50 font-bold uppercase hidden sm:block group-hover:text-indigo-400">Settings</p>
               <p className="font-bold text-[10px] sm:text-lg truncate max-w-[70px] sm:max-w-[200px]">
                 {players[user.uid]?.name || user.displayName || 'Anonymous'}
               </p>
@@ -772,7 +856,7 @@ export default function App() {
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
             maxLength={60}
-            placeholder="DIGITE ALGO..."
+            placeholder="TYPE SOMETHING..."
             className="flex-1 bg-black/95 border border-white/20 px-3 sm:px-6 py-2.5 sm:py-5 text-white text-[13px] sm:text-lg focus:outline-none focus:border-indigo-500 font-mono backdrop-blur-md shadow-2xl rounded-none appearance-none"
           />
           <button type="submit" className="bg-indigo-600 text-white px-4 sm:px-8 py-2.5 sm:py-5 border-b-4 border-indigo-900 hover:bg-indigo-500 active:translate-y-1 active:border-b-0 transition-all font-bold">
@@ -780,6 +864,58 @@ export default function App() {
           </button>
         </form>
       </div>
+
+      {isCustomizing && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm bg-[#161625] border-2 border-white/10 p-6 flex flex-col gap-6 shadow-2xl animate-in fade-in zoom-in duration-200">
+            <div className="flex justify-between items-center border-b border-white/10 pb-4">
+              <h2 className="text-white font-bold text-xl uppercase tracking-tighter italic">Customize Operative</h2>
+              <button 
+                onClick={() => setIsCustomizing(false)}
+                className="text-white/50 hover:text-white transition-colors"
+              >
+                CLOSE
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Codename</label>
+                <input 
+                  type="text"
+                  maxLength={15}
+                  value={players[user?.uid || '']?.name || ''}
+                  onChange={(e) => handleUpdateCustomization({ name: e.target.value })}
+                  className="bg-black/40 border border-white/10 px-4 py-3 text-white focus:outline-none focus:border-indigo-500 font-mono"
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Uniform Tint</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {COLORS.map((color) => (
+                    <button
+                      key={color}
+                      onClick={() => handleUpdateCustomization({ color })}
+                      className={`w-full aspect-square border-2 transition-all ${
+                        players[user?.uid || '']?.color === color ? 'border-indigo-500 scale-105' : 'border-black/50 hover:border-white/50 animate-pulse'
+                      }`}
+                      style={{ backgroundColor: `#${color.toString(16).padStart(6, '0')}` }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <button 
+              onClick={() => setIsCustomizing(false)}
+              className="w-full bg-indigo-600 text-white font-bold py-4 border-b-4 border-indigo-900 active:translate-y-1 active:border-b-0 transition-all uppercase"
+            >
+              Confirm Deployment
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
