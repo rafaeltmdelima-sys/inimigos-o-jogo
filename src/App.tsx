@@ -14,7 +14,7 @@ import {
   limitToLast
 } from 'firebase/database';
 import { io, Socket } from 'socket.io-client';
-import { Send, User, MessageSquare, Mic, MicOff, LogIn } from 'lucide-react';
+import { Send, User, MessageSquare, Mic, MicOff, LogIn, Hand } from 'lucide-react';
 import Peer from 'simple-peer';
 import { Buffer } from 'buffer';
 
@@ -316,8 +316,10 @@ export default function App() {
           ballSprite.current.setDepth(1000);
 
           // Responsive zoom
-          const zoom = window.innerWidth < 640 ? 1.0 : 1.5;
-          this.cameras.main.setZoom(zoom);
+          let initialZoom = 0.7;
+          if (window.innerWidth >= 1280) initialZoom = 1.0;
+          else if (window.innerWidth >= 640) initialZoom = 1.3;
+          this.cameras.main.setZoom(initialZoom);
           
           console.log("Phaser Scene Create finished");
         },
@@ -340,21 +342,29 @@ export default function App() {
               // Generic Avatar
               const body = this.add.rectangle(0, -10, 20, 40, p.color).setStrokeStyle(2, 0xffffff);
               const head = this.add.rectangle(0, -30, 16, 16, 0xffe0bd);
-              const name = this.add.text(0, 20, p.name, { fontSize: '12px', fontStyle: 'bold', fontFamily: 'monospace' }).setOrigin(0.5);
+              const name = this.add.text(0, 20, p.name, { fontSize: '12px', fontStyle: 'bold', fontFamily: 'monospace' }).setOrigin(0.5).setName('nameTag');
               
               container.add([body, head, name]);
-              container.setDepth(p.x + p.y);
+              // Robust depth sorting: x + y determines order within a floor, z * 100 separates floors
+              container.setDepth(p.x + p.y + (p.z || 0) * 100);
               playersSprites.current[id] = container;
             } else {
               const container = playersSprites.current[id];
               
               const oldX = container.x;
               const oldY = container.y;
+              const { x: isoX, y: isoY } = cartesianToIso(p.x, p.y, p.z || 0);
               
               // Smoother and slower movement
-              container.x = Phaser.Math.Linear(container.x, x, 0.04);
-              container.y = Phaser.Math.Linear(container.y, y, 0.04);
-              container.setDepth(p.x + p.y);
+              container.x = Phaser.Math.Linear(container.x, isoX, 0.04);
+              container.y = Phaser.Math.Linear(container.y, isoY, 0.04);
+              container.setDepth(p.x + p.y + (p.z || 0) * 100);
+
+              // Update name if changed
+              const nameTxt = container.getByName('nameTag') as Phaser.GameObjects.Text;
+              if (nameTxt && nameTxt.text !== p.name) {
+                nameTxt.setText(p.name);
+              }
 
               // Subtle bobbing animation when moving
               const isMoving = Math.abs(container.x - oldX) > 0.1 || Math.abs(container.y - oldY) > 0.1;
@@ -415,15 +425,15 @@ export default function App() {
             }
           });
 
-          // Update Ball
-          if (ballSprite.current) {
-            const b = ballRef.current;
-            const targetPos = cartesianToIso(b.x, b.y, b.z || 0);
-            
-            // Interpolate ball position
-            ballSprite.current.x = Phaser.Math.Linear(ballSprite.current.x, targetPos.x, 0.2);
-            ballSprite.current.y = Phaser.Math.Linear(ballSprite.current.y, targetPos.y, 0.2);
-            ballSprite.current.setDepth(b.x + b.y + 1);
+            // Update Ball
+            if (ballSprite.current) {
+              const b = ballRef.current;
+              const targetPos = cartesianToIso(b.x, b.y, b.z || 0);
+              
+              // Interpolate ball position
+              ballSprite.current.x = Phaser.Math.Linear(ballSprite.current.x, targetPos.x, 0.2);
+              ballSprite.current.y = Phaser.Math.Linear(ballSprite.current.y, targetPos.y, 0.2);
+              ballSprite.current.setDepth(b.x + b.y + (b.z || 0) * 100 + 1);
 
             // Local Physics (only for the local player to avoid conflicts)
             if (user) {
@@ -540,7 +550,10 @@ export default function App() {
         gameRef.current.scale.resize(window.innerWidth, window.innerHeight);
         const scene = gameRef.current.scene.getAt(0);
         if (scene) {
-          const zoom = window.innerWidth < 640 ? 0.7 : 1.5;
+          // Dynamic zoom: mobile still 0.7, medium screens 1.2, large screens 1.0 (to see more of the map)
+          let zoom = 0.7;
+          if (window.innerWidth >= 1280) zoom = 1.0;
+          else if (window.innerWidth >= 640) zoom = 1.3;
           scene.cameras.main.setZoom(zoom);
         }
       }
@@ -557,11 +570,53 @@ export default function App() {
 
   const enviarMovimento = (x: number, y: number, z: number) => {
     if (user) {
-      const currentPlayer = players[user.uid];
-      if (currentPlayer?.grabbedBy) return; // Can't move while grabbed!
+      // USE REF to avoid closure staleness
+      const currentPlayers = playersRef.current;
+      const currentPlayer = currentPlayers[user.uid];
+      if (!currentPlayer) return;
+      if (currentPlayer.grabbedBy) return; // Can't move while grabbed!
+
+      // Teleport Constraint: Must use stairs to switch floors
+      const isTargetStairs = x >= 12 && x <= 16;
+      const isCurrentStairs = currentPlayer.x >= 12 && currentPlayer.x <= 16;
+      
+      if (Math.abs(currentPlayer.z - z) > 0.1) {
+        if (!isTargetStairs && !isCurrentStairs) {
+          return;
+        }
+      }
 
       const playerRef = ref(rtdb, `jogadores/${user.uid}`);
       update(playerRef, { x, y, z });
+    }
+  };
+
+  const handleGrab = () => {
+    if (!user) return;
+    const me = players[user.uid];
+    if (me) {
+      // Find closest player within radius
+      let closestDist = 1.5; 
+      let targetId = null;
+
+      Object.values(players).forEach(p => {
+        if (p.id === user.uid) return;
+        const dist = Math.sqrt(Math.pow(p.x - me.x, 2) + Math.pow(p.y - me.y, 2));
+        if (dist < closestDist) {
+          closestDist = dist;
+          targetId = p.id;
+        }
+      });
+
+      if (targetId) {
+        const targetRef = ref(rtdb, `jogadores/${targetId}`);
+        update(targetRef, { grabbedBy: user.uid });
+        
+        // Auto-release after 5 seconds
+        setTimeout(() => {
+          update(targetRef, { grabbedBy: null });
+        }, 5000);
+      }
     }
   };
 
@@ -590,34 +645,9 @@ export default function App() {
       }
 
       if (chatInput.trim().toLowerCase() === '/grab') {
-        const me = players[user.uid];
-        if (me) {
-          // Find closest player within radius
-          let closestDist = 1.5; 
-          let targetId = null;
-
-          Object.values(players).forEach(p => {
-            if (p.id === user.uid) return;
-            const dist = Math.sqrt(Math.pow(p.x - me.x, 2) + Math.pow(p.y - me.y, 2));
-            if (dist < closestDist) {
-              closestDist = dist;
-              targetId = p.id;
-            }
-          });
-
-          if (targetId) {
-            const targetRef = ref(rtdb, `jogadores/${targetId}`);
-            update(targetRef, { grabbedBy: user.uid });
-            
-            // Auto-release after 5 seconds
-            setTimeout(() => {
-              update(targetRef, { grabbedBy: null });
-            }, 5000);
-          }
-          
-          setChatInput('');
-          return;
-        }
+        handleGrab();
+        setChatInput('');
+        return;
       }
       
       // Update player message bubble
@@ -642,7 +672,7 @@ export default function App() {
   if (isAuthLoading) {
     return (
       <div className="h-screen w-full bg-[#1a1a2e] flex items-center justify-center font-mono">
-        <div className="text-white text-xl animate-pulse">CARREGANDO INIMIGOS...</div>
+        <div className="text-white text-xl animate-pulse">LOADING...</div>
       </div>
     );
   }
@@ -653,29 +683,29 @@ export default function App() {
       
       <div className="absolute top-2 left-2 sm:top-6 sm:left-6 z-10 flex flex-col gap-2 sm:gap-4 max-w-[calc(100%-1rem)]">
         <div className="flex gap-2 items-start">
-          <div className="bg-black/80 border border-white/20 p-1.5 sm:p-3 flex items-center gap-2 sm:gap-3 text-white backdrop-blur-sm shadow-xl">
+          <div className="bg-black/80 border sm:border-2 border-white/20 p-1.5 sm:p-3 flex items-center gap-2 sm:gap-4 text-white backdrop-blur-sm shadow-2xl">
             {user.photoURL ? (
-              <img src={user.photoURL} className="w-6 h-6 sm:w-10 sm:h-10 border border-white" alt="Avatar" />
+              <img src={user.photoURL} className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white" alt="Avatar" referrerPolicy="no-referrer" />
             ) : (
-              <div className="w-6 h-6 sm:w-10 sm:h-10 border border-white bg-white/10 flex items-center justify-center">
-                <User size={12} className="text-white/50" />
+              <div className="w-6 h-6 sm:w-12 sm:h-12 border sm:border-2 border-white bg-white/10 flex items-center justify-center">
+                <User size={12} className="text-white/50 sm:size-6" />
               </div>
             )}
             <div className="overflow-hidden">
-              <p className="text-[7px] sm:text-[10px] text-white/50 font-bold uppercase hidden sm:block">User</p>
-              <p className="font-bold text-[10px] sm:text-sm truncate max-w-[70px] sm:max-w-none">
+              <p className="text-[7px] sm:text-[11px] text-white/50 font-bold uppercase hidden sm:block">User</p>
+              <p className="font-bold text-[10px] sm:text-lg truncate max-w-[70px] sm:max-w-[200px]">
                 {players[user.uid]?.name || user.displayName || 'Anonymous'}
               </p>
             </div>
           </div>
 
-          <button onClick={() => setIsVoiceActive(!isVoiceActive)} className={`flex items-center gap-2 p-1.5 sm:p-3 border transition-all backdrop-blur-sm shadow-xl ${isVoiceActive ? 'bg-green-500/40 border-green-500 text-green-400' : 'bg-black/80 border-white/20 text-white/60'}`}>
-            <div className={`w-6 h-6 sm:w-10 sm:h-10 flex items-center justify-center ${isVoiceActive ? 'bg-green-500 text-white' : 'bg-white/10'}`}>
-              {isVoiceActive ? <Mic size={14} /> : <MicOff size={14} />}
+          <button onClick={() => setIsVoiceActive(!isVoiceActive)} className={`flex items-center gap-2 p-1.5 sm:p-3 border sm:border-2 transition-all backdrop-blur-sm shadow-2xl ${isVoiceActive ? 'bg-green-500/40 border-green-500 text-green-400' : 'bg-black/80 border-white/20 text-white/60'}`}>
+            <div className={`w-6 h-6 sm:w-12 sm:h-12 flex items-center justify-center ${isVoiceActive ? 'bg-green-500 text-white' : 'bg-white/10'}`}>
+              {isVoiceActive ? <Mic size={14} className="sm:size-6" /> : <MicOff size={14} className="sm:size-6" />}
             </div>
             <div className="text-left hidden sm:block">
-              <p className="text-[8px] sm:text-[10px] font-bold uppercase">Voice</p>
-              <p className="text-[10px] sm:text-xs">{isVoiceActive ? 'ON' : 'OFF'}</p>
+              <p className="text-[8px] sm:text-[11px] font-bold uppercase">Voice</p>
+              <p className="text-[10px] sm:text-xs font-bold">{isVoiceActive ? 'ON' : 'OFF'}</p>
             </div>
           </button>
           
@@ -685,13 +715,21 @@ export default function App() {
           >
             <MessageSquare size={16} className={isChatLogVisible ? 'text-indigo-400' : ''} />
           </button>
+
+          <button 
+            onClick={handleGrab}
+            className="sm:hidden bg-indigo-600 border border-white/20 p-1.5 text-white flex items-center justify-center w-9 h-9 active:bg-indigo-500 shadow-xl"
+            title="Grab"
+          >
+            <Hand size={16} />
+          </button>
         </div>
 
-        <div className={`${isChatLogVisible ? 'flex' : 'hidden'} sm:flex bg-black/40 border border-white/10 p-2 sm:p-3 backdrop-blur-[2px] flex-col gap-2 max-h-[120px] sm:max-h-[160px] overflow-hidden w-full sm:w-80 hover:bg-black/60 transition-colors shadow-lg`}>
+        <div className={`${isChatLogVisible ? 'flex' : 'hidden'} sm:flex bg-black/40 border sm:border-2 border-white/10 p-2 sm:p-4 backdrop-blur-[2px] flex-col gap-2 max-h-[120px] sm:max-h-[300px] overflow-hidden w-full sm:w-96 hover:bg-black/60 transition-colors shadow-2xl`}>
           <div className="flex items-center justify-between border-b border-white/10 pb-1 mb-1">
             <div className="flex items-center gap-2">
-              <MessageSquare size={12} className="text-indigo-400" />
-              <p className="text-[9px] font-bold text-white/40 uppercase tracking-widest">Chat Log</p>
+              <MessageSquare size={12} className="text-indigo-400 sm:size-4" />
+              <p className="text-[9px] sm:text-[11px] font-bold text-white/40 uppercase tracking-widest">Chat Log</p>
             </div>
           </div>
           <div 
@@ -702,7 +740,7 @@ export default function App() {
               <p className="text-[9px] text-white/30 italic">No messages...</p>
             ) : (
               chatLog.map((msg) => (
-                <div key={msg.id} className="text-[10px] sm:text-[11px] break-words">
+                <div key={msg.id} className="text-[10px] sm:text-sm break-words">
                   <span className="text-indigo-400 font-bold">{msg.name}: </span>
                   <span className="text-white/70">{msg.text}</span>
                 </div>
@@ -727,18 +765,18 @@ export default function App() {
         )}
       </div>
 
-      <div className="absolute bottom-4 sm:bottom-8 left-1/2 -translate-x-1/2 w-full max-w-[95vw] sm:max-w-md px-2 sm:px-4 z-10">
+      <div className="absolute bottom-4 sm:bottom-8 left-1/2 -translate-x-1/2 w-full max-w-[95vw] sm:max-w-xl px-2 sm:px-4 z-10">
         <form onSubmit={handleSendChat} className="flex gap-1 sm:gap-2">
           <input
             type="text"
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
             maxLength={60}
-            placeholder="DIGITE..."
-            className="flex-1 bg-black/95 border border-white/20 px-3 sm:px-6 py-2.5 sm:py-4 text-white text-[13px] sm:text-base focus:outline-none focus:border-indigo-500 font-mono backdrop-blur-md shadow-2xl rounded-none appearance-none"
+            placeholder="DIGITE ALGO..."
+            className="flex-1 bg-black/95 border border-white/20 px-3 sm:px-6 py-2.5 sm:py-5 text-white text-[13px] sm:text-lg focus:outline-none focus:border-indigo-500 font-mono backdrop-blur-md shadow-2xl rounded-none appearance-none"
           />
-          <button type="submit" className="bg-indigo-600 text-white px-4 sm:px-6 py-2.5 sm:py-4 border-b-4 border-indigo-900 hover:bg-indigo-500 active:translate-y-1 active:border-b-0 transition-all">
-            <Send size={18} />
+          <button type="submit" className="bg-indigo-600 text-white px-4 sm:px-8 py-2.5 sm:py-5 border-b-4 border-indigo-900 hover:bg-indigo-500 active:translate-y-1 active:border-b-0 transition-all font-bold">
+            <Send size={18} className="sm:size-6" />
           </button>
         </form>
       </div>
