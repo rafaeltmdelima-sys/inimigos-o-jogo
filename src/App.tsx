@@ -46,10 +46,14 @@ interface PlayerData {
   isVoiceActive?: boolean;
 }
 
+const MAZE_WALLS = new Set([]);
+
+const MEDAL_POS = { x: 27, y: 11, z: 0 };
+const START_POS = { x: 1, y: 1, z: 2 };
+
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [players, setPlayers] = useState<Record<string, PlayerData>>({});
-  const [ball, setBall] = useState<{ x: number, y: number, z: number, vx: number, vy: number }>({ x: 5, y: 5, z: 2, vx: 0, vy: 0 });
   const [chatLog, setChatLog] = useState<{ id: string, name: string, text: string }[]>([]);
   const [isChatLogVisible, setIsChatLogVisible] = useState(true);
   const [chatInput, setChatInput] = useState('');
@@ -66,18 +70,12 @@ export default function App() {
   const playersSprites = useRef<Record<string, Phaser.GameObjects.Container>>({});
   const peersRef = useRef<Record<string, Peer.Instance>>({});
   const playersRef = useRef<Record<string, PlayerData>>({});
-  const ballRef = useRef<{ x: number, y: number, z: number, vx: number, vy: number }>({ x: 5, y: 5, z: 2, vx: 0, vy: 0 });
-  const ballSprite = useRef<Phaser.GameObjects.Arc | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
 
   // Sync players state to ref for Phaser access
   useEffect(() => {
     playersRef.current = players;
   }, [players]);
-
-  useEffect(() => {
-    ballRef.current = ball;
-  }, [ball]);
 
   // Auto-scroll chat to bottom
   useEffect(() => {
@@ -209,9 +207,9 @@ export default function App() {
           const initialData = {
             id: u.uid,
             name: u.displayName || `Anon_${u.uid.substring(0, 4)}`,
-            x: 5,
-            y: 5,
-            z: 2, // Top floor
+            x: START_POS.x,
+            y: START_POS.y,
+            z: START_POS.z,
             color: Math.floor(Math.random() * 16777215),
             message: '',
             lastActive: serverTimestamp()
@@ -248,8 +246,8 @@ export default function App() {
     });
 
     console.log("Starting RTDB onValue listener for 'jogadores'...");
-    const playersRef = ref(rtdb, 'jogadores');
-    const unsubscribe = onValue(playersRef, (snapshot) => {
+    const dbPlayersRef = ref(rtdb, 'jogadores');
+    const unsubscribe = onValue(dbPlayersRef, (snapshot) => {
       const data = snapshot.val() || {};
       console.log("RTDB Data Received:", Object.keys(data).length, "players found");
       setPlayers(data);
@@ -257,33 +255,32 @@ export default function App() {
       console.error("RTDB onValue Error:", error);
     });
 
-    // Ball Listener
-    const bolaRef = ref(rtdb, 'bola');
-    const unsubscribeBall = onValue(bolaRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        setBall({ x: data.x, y: data.y, z: data.z || 0, vx: data.vx, vy: data.vy });
-      } else {
-        // Initialize ball if not exists
-        set(bolaRef, { x: 5, y: 5, z: 2, vx: 0, vy: 0 });
-      }
-    });
-
-    // Chat History Listener - Increase limit so user can scroll up a bit
-    const mensagensRef = query(ref(rtdb, 'mensagens'), limitToLast(30));
+    // Chat History Listener - Resets to 0 once 20 messages are reached
+    const mensagensRef = ref(rtdb, 'mensagens');
     const unsubscribeChat = onValue(mensagensRef, (snapshot) => {
       const data = snapshot.val() || {};
-      const messages = Object.entries(data).map(([id, msg]: [string, any]) => ({
-        id,
-        name: msg.name,
-        text: msg.text
-      }));
+      const entries = Object.entries(data);
+      
+      // If we reach 20 messages, clear the collection
+      if (entries.length >= 20) {
+        const firstPlayerId = Object.keys(playersRef.current).sort()[0];
+        if (user && user.uid === firstPlayerId) {
+          set(ref(rtdb, 'mensagens'), null);
+        }
+      }
+
+      const messages = entries
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([id, msg]: [string, any]) => ({
+          id,
+          name: msg.name,
+          text: msg.text
+        }));
       setChatLog(messages);
     });
 
     return () => {
       unsubscribe();
-      unsubscribeBall();
       unsubscribeChat();
     };
   }, [user]);
@@ -350,6 +347,7 @@ export default function App() {
               for (let j = startY; j < endY; j++) {
                 const { x, y } = cartesianToIso(i, j, z);
                 const points = [0, -16, 32, 0, 0, 16, -32, 0];
+                
                 const poly = this.add.polygon(x, y, points, color);
                 poly.setStrokeStyle(1, 0x1a1a2e, 0.5);
                 poly.setInteractive(new Phaser.Geom.Polygon(points), Phaser.Geom.Polygon.Contains);
@@ -357,6 +355,21 @@ export default function App() {
                 poly.on('pointerover', () => poly.setFillStyle(color + 0x111111));
                 poly.on('pointerout', () => poly.setFillStyle(color));
                 poly.setDepth(i + j + (z * 10) - 100);
+
+                // Draw Medal if it's the medal spot
+                if (i === MEDAL_POS.x && j === MEDAL_POS.y && z === MEDAL_POS.z) {
+                  const medal = this.add.star(x, y - 10, 5, 8, 16, 0xffd700);
+                  medal.setStrokeStyle(2, 0xffa500);
+                  this.tweens.add({
+                    targets: medal,
+                    y: y - 20,
+                    duration: 1000,
+                    yoyo: true,
+                    repeat: -1,
+                    ease: 'Sine.easeInOut'
+                  });
+                  medal.setDepth(i + j + (z * 10) + 1);
+                }
               }
             }
           };
@@ -387,11 +400,6 @@ export default function App() {
           this.cameras.main.setBounds(-totalWidth/2, -totalHeight/2, totalWidth, totalHeight);
           this.cameras.main.centerOn(0, 12 * TILE_HEIGHT / 2);
           
-          // Add Ball Sprite
-          const ballPos = cartesianToIso(ballRef.current.x, ballRef.current.y, ballRef.current.z);
-          ballSprite.current = this.add.circle(ballPos.x, ballPos.y, 12, 0xffffff).setStrokeStyle(2, 0x000000);
-          ballSprite.current.setDepth(1000);
-
           // Responsive zoom
           let initialZoom = 0.7;
           if (window.innerWidth >= 1280) initialZoom = 1.0;
@@ -502,118 +510,40 @@ export default function App() {
             }
           });
 
-            // Update Ball
-            if (ballSprite.current) {
-              const b = ballRef.current;
-              const targetPos = cartesianToIso(b.x, b.y, b.z || 0);
-              
-              // Interpolate ball position
-              ballSprite.current.x = Phaser.Math.Linear(ballSprite.current.x, targetPos.x, 0.2);
-              ballSprite.current.y = Phaser.Math.Linear(ballSprite.current.y, targetPos.y, 0.2);
-              ballSprite.current.setDepth(b.x + b.y + (b.z || 0) * 100 + 1);
-
-            // Local Physics (only for the local player to avoid conflicts)
-            if (user) {
-              const p = currentPlayers[user.uid];
-              if (p) {
-                // Handle grabbing logic: if I am grabbing someone, sync their position with a small delay
-                Object.values(currentPlayers).forEach(otherP => {
-                  if (otherP.grabbedBy === user.uid) {
-                    const targetRef = ref(rtdb, `jogadores/${otherP.id}`);
-                    // Use Phaser's linear interpolation for the sync logic but locally we just push to RTDB
-                    // To get a "delay" effect, we can use a simpler lerp toward current position
-                    const lerpX = Phaser.Math.Linear(otherP.x, p.x, 0.1);
-                    const lerpY = Phaser.Math.Linear(otherP.y, p.y, 0.1);
-                    update(targetRef, { x: lerpX, y: lerpY, z: p.z });
-                  }
+          // Local Physics (only for the local player to avoid conflicts)
+          if (user) {
+            const p = currentPlayers[user.uid];
+            if (p) {
+              // Medal pickup logic
+              if (Math.round(p.x) === MEDAL_POS.x && Math.round(p.y) === MEDAL_POS.y && Math.round(p.z) === MEDAL_POS.z) {
+                const playerRef = ref(rtdb, `jogadores/${user.uid}`);
+                update(playerRef, { 
+                  x: START_POS.x, 
+                  y: START_POS.y, 
+                  z: START_POS.z,
+                  message: 'I GOT THE MEDAL! 🏆'
                 });
+                
+                // Clear any ongoing movement to prevent immediately moving back
+                if (movementInterval.current) clearInterval(movementInterval.current);
 
-                const dist = Phaser.Math.Distance.Between(p.x, p.y, b.x, b.y);
-                if (dist < 1.0) {
-                  // Kick the ball!
-                  const angle = Phaser.Math.Angle.Between(p.x, p.y, b.x, b.y);
-                  // Heavier feel: lower force (0.3 instead of 0.5)
-                  const force = 0.3;
-                  const newVx = Math.cos(angle) * force;
-                  const newVy = Math.sin(angle) * force;
-                  
-                  // Update ball in RTDB
-                  const bolaRef = ref(rtdb, 'bola');
-                  update(bolaRef, { 
-                    vx: newVx, 
-                    vy: newVy,
-                    x: b.x + newVx * 0.5, // Small nudge to prevent getting stuck
-                    y: b.y + newVy * 0.5
-                  });
+                // Auto clear special message
+                setTimeout(() => {
+                  update(playerRef, { message: '' });
+                }, 3000);
+              }
+
+              // Handle grabbing logic: if I am grabbing someone, sync their position with a small delay
+              Object.values(currentPlayers).forEach(otherP => {
+                if (otherP.grabbedBy === user.uid) {
+                  const targetRef = ref(rtdb, `jogadores/${otherP.id}`);
+                  // Use Phaser's linear interpolation for the sync logic but locally we just push to RTDB
+                  // To get a "delay" effect, we can use a simpler lerp toward current position
+                  const lerpX = Phaser.Math.Linear(otherP.x, p.x, 0.1);
+                  const lerpY = Phaser.Math.Linear(otherP.y, p.y, 0.1);
+                  update(targetRef, { x: lerpX, y: lerpY, z: p.z });
                 }
-              }
-            }
-
-            // Ball friction and movement (simulated locally for smoothness, but synced)
-            if (Math.abs(b.vx) > 0.005 || Math.abs(b.vy) > 0.005) {
-              const friction = 0.92;
-              let nextX = b.x + b.vx;
-              let nextY = b.y + b.vy;
-              let nextVx = b.vx * friction;
-              let nextVy = b.vy * friction;
-              let nextZ = b.z;
-
-              // Boundary Box logic based on current section
-              const margin = 0.2;
-              
-              const isUpper = nextX <= 12;
-              const isLower = nextX >= 16;
-              const isStairs = nextX > 12 && nextX < 16 && nextY >= 4 && nextY <= 8;
-
-              if (isUpper) {
-                // Bounds for upper floor
-                if (nextX < margin) { nextX = margin; nextVx *= -0.6; }
-                if (nextY < margin) { nextY = margin; nextVy *= -0.6; }
-                if (nextY > 12 - margin) { nextY = 12 - margin; nextVy *= -0.6; }
-                // Fall off edge if not aligned with stairs
-                if (nextX > 12 - margin && (nextY < 4 || nextY > 8)) {
-                  nextX = 12 - margin; nextVx *= -0.6;
-                }
-                nextZ = 2;
-              } else if (isLower) {
-                // Bounds for lower floor
-                if (nextX > 28 - margin) { nextX = 28 - margin; nextVx *= -0.6; }
-                if (nextY < margin) { nextY = margin; nextVy *= -0.6; }
-                if (nextY > 12 - margin) { nextY = 12 - margin; nextVy *= -0.6; }
-                // Edge check for stairs
-                if (nextX < 16 + margin && (nextY < 4 || nextY > 8)) {
-                  nextX = 16 + margin; nextVx *= -0.6;
-                }
-                nextZ = 0;
-              } else if (isStairs) {
-                // Bounds for stairs
-                if (nextY < 4 + margin) { nextY = 4 + margin; nextVy *= -0.6; }
-                if (nextY > 8 - margin) { nextY = 8 - margin; nextVy *= -0.6; }
-                nextZ = 2 - (nextX - 12) * 0.5;
-              } else {
-                // Fallback / Bounce back to upper if lost
-                nextX = 11.5; nextVx *= -1;
-              }
-
-              // Only update RTDB if we are the "active" physics handler (first player in list)
-              const firstPlayerId = Object.keys(currentPlayers).sort()[0];
-              if (user && user.uid === firstPlayerId) {
-                const bolaRef = ref(rtdb, 'bola');
-                update(bolaRef, { 
-                  x: nextX, 
-                  y: nextY, 
-                  z: nextZ,
-                  vx: nextVx, 
-                  vy: nextVy 
-                });
-              }
-            } else if (Math.abs(b.vx) > 0 || Math.abs(b.vy) > 0) {
-              // Stop completely if very slow
-              const firstPlayerId = Object.keys(currentPlayers).sort()[0];
-              if (user && user.uid === firstPlayerId) {
-                const bolaRef = ref(rtdb, 'bola');
-                update(bolaRef, { vx: 0, vy: 0 });
-              }
+              });
             }
           }
         }
@@ -720,7 +650,7 @@ export default function App() {
       }
 
       if (chatInput.trim().toLowerCase() === '/home') {
-        update(playerRef, { x: 5, y: 5, z: 2 });
+        update(playerRef, { x: START_POS.x, y: START_POS.y, z: START_POS.z });
         setChatInput('');
         return;
       }
